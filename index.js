@@ -28,8 +28,9 @@ const CursorTypes = {
 };
 
 class CursorDancePartyHandler {
-    constructor(uri) {
+    constructor(uri, origin) {
         this.uri = uri;
+        this.origin = origin;
         this.socket = null;
         this.ping_interval = null;
         this.ping_sent = null;
@@ -43,12 +44,12 @@ class CursorDancePartyHandler {
 
     async connect() {
         return new Promise(async (res) => {
-            const polling_res = await fetch("https://cursordanceparty.com/socket.io/?EIO=3&transport=polling");
+            const polling_res = await fetch(`${this.origin}/socket.io/?EIO=3&transport=polling`);
             const cookies = Object.fromEntries((polling_res.headers.get("set-cookie") || '').split('; ').map(cookie => cookie.split('=').map(part => part.trim())));
 
             this._id = cookies.io;
             this.socket = new WebSocket(`${this.uri}/socket.io/?EIO=3&transport=websocket&sid=${this._id}`, {
-                origin: "https://cursordanceparty.com"
+                origin: this.origin
             });
 
             this.socket.on("open", () => {
@@ -91,7 +92,7 @@ class CursorDancePartyHandler {
     sendPing() {
         this.socket.send("2");
         this.ping_sent = Date.now();
-        console.log("[WS => CDP] Ping!");
+        console.log("[WS => CDP] Sent ping.");
 
         return this;
     }
@@ -230,7 +231,7 @@ class User {
 
 
 (async () => {
-    const client = new CursorDancePartyHandler("wss://cursordanceparty.com");
+    const client = new CursorDancePartyHandler("wss://cursordanceparty.com", "https://cursordanceparty.com");
     await client.connect();
 
     console.log(`User ID: ${client._id}`);
@@ -323,7 +324,7 @@ class User {
             let id = i + 1;
             await client.wait(0);
 
-            let cl = new CursorDancePartyHandler(client.uri);
+            let cl = new CursorDancePartyHandler(client.uri, client.origin);
             await cl.connect();
 
             client.clients.push(cl);
@@ -372,12 +373,10 @@ class User {
     client.on("partier-joined", (data) => {
         const user = new User(data.id);
         users.set(data.id, user);
-        console.log(`User joined: ${user._id}`);
     });
 
     client.on("partier-left", (data) => {
         if (users.has(data.id)) {
-            console.log(`User left: ${users.get(data.id)._id}`);
             users.delete(data.id);
         }
     });
@@ -386,7 +385,6 @@ class User {
         if (!users.has(data.id)) {
             const user = new User(data.id);
             users.set(data.id, user);
-            console.log(`Created new user: ${user._id}`);
         }
 
         const user = users.get(data.id);
