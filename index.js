@@ -1,7 +1,13 @@
-const WebSocket = require("ws");
+const io = require("socket.io-client");
+const config = require("./config.json");
 
+// Utility function for clamping numbers
 Math.clamp = (min, num, max) => {
     return Math.min(Math.max(num, min), max);
+};
+Math.rand = (min, max, floor = false) => {
+    const rand = (Math.random() * (max - min)) + min;
+    return floor ? Math.floor(rand) : rand;
 };
 
 const CursorTypes = {
@@ -28,189 +34,176 @@ const CursorTypes = {
 };
 
 class CursorDancePartyHandler {
-    constructor(uri, origin) {
+    constructor(uri) {
         this.uri = uri;
-        this.origin = origin;
         this.socket = null;
-        this.ping_interval = null;
-        this.ping_sent = null;
         this.handlers = {};
         this.mouse = { x: 0, y: 0, angle: 0, cursor: 0, scale: 0.15, rotations: 0 };
         this.last_mouse = "";
-
-        this.connected = false;
         this.clients = [];
+        this.users = new Map();
     }
 
-    async connect() {
-        return new Promise(async (res) => {
-            const polling_res = await fetch(`${this.origin}/socket.io/?EIO=3&transport=polling`);
-            const cookies = Object.fromEntries((polling_res.headers.get("set-cookie") || '').split('; ').map(cookie => cookie.split('=').map(part => part.trim())));
-
-            this._id = cookies.io;
-            this.socket = new WebSocket(`${this.uri}/socket.io/?EIO=3&transport=websocket&sid=${this._id}`, {
-                origin: this.origin
+    // Combined connection/start method.
+    // Returns a promise that resolves with "this" to allow daisy chaining.
+    start() {
+        return new Promise((resolve, reject) => {
+            console.log(`[DEBUG] Attempting to connect to ${this.uri}`);
+            this.socket = io(this.uri, {
+                transports: ["websocket", "polling"],
+                path: "/socket.io"
             });
 
-            this.socket.on("open", () => {
-                this.socket.send("2probe");
-
-                res();
+            this.socket.on("connect", () => {
+                console.log(`[DEBUG] Connected. Socket ID: ${this.socket.id}`);
+                this.bindSocketEvents();
+                this.socket.emit("self-joined");
+                if (this.handlers["self-joined"]) {
+                    setTimeout(() => {
+                        this.handlers["self-joined"]({ id: this.socket.id, mouse: this.mouse });
+                    }, 0);
+                }
+                resolve(this);
             });
 
-            this.socket.on("close", () => {
-                console.log("WebSocket connection closed.");
-                this.stopPing();
+            this.socket.on("connect_error", (error) => {
+                console.error("[DEBUG] Connection error:", error);
+                reject(error);
             });
 
             this.socket.on("error", (error) => {
-                console.error("WebSocket error:", error);
+                console.error("[DEBUG] Socket error:", error);
             });
 
-            this.socket.on("message", (msg) => this.handleMessage(msg));
+            this.socket.on("disconnect", (reason) => {
+                console.log(`[DEBUG] Disconnected. Reason: ${reason}`);
+            });
+
+            this.socket.on("reconnect_attempt", (attemptNumber) => {
+                console.log(`[DEBUG] Reconnect attempt #${attemptNumber}`);
+            });
+
+            this.socket.on("reconnect", (attemptNumber) => {
+                console.log(`[DEBUG] Reconnected on attempt #${attemptNumber}`);
+            });
+
+            this.socket.on("reconnect_failed", () => {
+                console.log("[DEBUG] Reconnect failed");
+            });
         });
     }
 
+    // New stop method to cleanly disconnect.
+    stop() {
+        if (this.mouse_buffer_interval) {
+            clearInterval(this.mouse_buffer_interval);
+            this.mouse_buffer_interval = null;
+        }
+        if (this.socket) {
+            this.socket.disconnect();
+            this.socket = null;
+        }
+        return this;
+    }
+
     isConnected() {
-        return this.socket && this.socket.readyState === WebSocket.OPEN && this.connected;
+        return this.socket && this.socket.connected;
     }
 
-    startPing() {
-        this.ping_interval = setInterval(() => {
-            this.sendPing();
-        }, 20000);
+    bindSocketEvents() {
+        Object.keys(this.handlers).forEach((event) => {
+            this.socket.on(event, this.handlers[event]);
+        });
 
-        return this;
-    }
+        this.on("partier-joined", (data) => {
+            console.log("[DEBUG] Partier joined:", data.id);
+            const user = new User(data.id);
+            this.users.set(data.id, user);
+        });
 
-    stopPing() {
-        clearInterval(this.ping_interval);
+        this.on("partier-left", (data) => {
+            console.log("[DEBUG] Partier left:", data.id);
+            if (this.users.has(data.id)) {
+                this.users.delete(data.id);
+            }
+        });
 
-        return this;
-    }
+        this.on("mouse-coords", (data) => {
+            if (!this.users.has(data.id)) {
+                const user = new User(data.id);
+                this.users.set(data.id, user);
+            }
+            const user = this.users.get(data.id);
+            user.setMouseData(data.mouse);
+        });
 
-    sendPing() {
-        this.socket.send("2");
-        this.ping_sent = Date.now();
-        console.log("[WS => CDP] Sent ping.");
-
+        this.bindIntervals();
         return this;
     }
 
     bindIntervals() {
-        this.startPing().sendPing();
         this.mouse_buffer_interval = setInterval(() => {
-            if (JSON.stringify(this.mouse) != this.last_mouse) {
+            if (JSON.stringify(this.mouse) !== this.last_mouse) {
                 this.send("mouse-coords", this.mouse);
                 this.last_mouse = JSON.stringify(this.mouse);
             }
-        }, 100);
-
+        }, 20);
         return this;
     }
 
-    send(_id, message) {
-        if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-            const msg = `42${JSON.stringify([_id, message])}`;
-            this.socket.send(msg);
+    send(event, message) {
+        if (this.isConnected()) {
+            this.socket.emit(event, message);
         }
-
         return this;
     }
 
-    on(_id, handler) {
-        this.handlers[_id] = handler;
-
+    on(event, handler) {
+        this.handlers[event] = handler;
+        if (this.socket) {
+            this.socket.on(event, handler);
+        }
         return this;
     }
 
     wait(ms) {
-        return new Promise(res => {
-            setTimeout(res, ms);
-        });
+        return new Promise((res) => setTimeout(res, ms));
     }
 
-    setMousePos(x, y) {
-        this.mouse.x = Math.clamp(0, x, 1);
-        this.mouse.y = Math.clamp(0, y, 1);
+    setMousePos(x, y, clamp = false) {
+        if (clamp) {
+            x = Math.clamp(0, x, 1);
+            y = Math.clamp(0, y, 1);
+        }
 
+        this.mouse.x = x;
+        this.mouse.y = y;
         return this;
     }
+
     setMouseAngle(angle) {
         this.mouse.angle = angle;
-
         return this;
     }
+
     setMouseScale(scale) {
         this.mouse.scale = Math.clamp(0.05, scale, 10);
-
         return this;
     }
+
     setMouseCursor(type) {
         this.mouse.cursor = type;
-
         return this;
     }
+
     rotateMouse() {
         this.mouse.rotations++;
-
         return this;
     }
+
     setMouseData(data) {
         this.mouse = data;
-
         return this;
-    }
-
-    handleMessage(msg) {
-        msg = msg.toString();
-
-        switch (msg) {
-            case "3probe":
-                this.socket.send("5");
-                this.connected = true;
-                this.handleParsedMessage({
-                    _id: "self-joined"
-                });
-
-                return this.bindIntervals();
-            case "3":
-                return console.log(`[CDP => WS] Pong! (${Date.now() - this.ping_sent}ms)`);
-        }
-
-        const message = this.parseSocketMessage(msg);
-        if (message) {
-            this.handleParsedMessage(message);
-        }
-    }
-
-    parseSocketMessage(msg) {
-        const match = msg.match(/^(\d+)(\[(.*)\])$/);
-        if (match) {
-            const id = match[1];
-            const json = match[2];
-
-            try {
-                const parsed = JSON.parse(json);
-                const name = parsed[0];
-                const data = parsed[1];
-
-                return {
-                    _id: name,
-                    data: data
-                };
-            } catch (error) {
-                console.error("Failed to parse JSON:", error);
-            }
-        }
-        return null;
-    }
-
-    handleParsedMessage(message) {
-        const handler = this.handlers[message._id];
-        if (handler) {
-            handler(message.data); // Call the handler with the data
-        }
     }
 }
 
@@ -225,169 +218,308 @@ class User {
     }
 
     toString() {
-        return `User ID: ${this._id}, Mouse Position: (${this.mouseCoords.x}, ${this.mouseCoords.y})`;
+        return `User ID: ${this._id}, Mouse Position: (${this.mouse.x}, ${this.mouse.y})`;
     }
 }
 
-
-(async () => {
-    const client = new CursorDancePartyHandler("wss://cursordanceparty.com", "https://cursordanceparty.com");
-    await client.connect();
-
-    console.log(`User ID: ${client._id}`);
-    const users = new Map();
-
-    function generateVertices() {
-        let vertices = [];
-        let coords = new Array(dimensions).fill(-1);
-        function recurse(i) {
-            if (i === dimensions) {
-                vertices.push([...coords]);
-                return;
-            }
-            coords[i] = -1;
-            recurse(i + 1);
-            coords[i] = 1;
-            recurse(i + 1);
-        };
-        recurse(0);
-        return vertices;
+// Helper functions.
+function generateVertices(dimensions) {
+    let vertices = [];
+    let coords = new Array(dimensions).fill(-1);
+    function recurse(i) {
+        if (i === dimensions) {
+            vertices.push([...coords]);
+            return;
+        }
+        coords[i] = -1;
+        recurse(i + 1);
+        coords[i] = 1;
+        recurse(i + 1);
     }
-    function generateEdges(vertices) {
-        const edges = [];
-        for (let i = 0; i < vertices.length; i++) {
-            for (let j = i + 1; j < vertices.length; j++) {
-                if (vertices[i].reduce((acc, val, k) => acc + Math.abs(val - vertices[j][k]), 0) === 2) {
-                    edges.push([i, j]);
-                }
+    recurse(0);
+    return vertices;
+}
+
+function generateEdges(vertices) {
+    const edges = [];
+    for (let i = 0; i < vertices.length; i++) {
+        for (let j = i + 1; j < vertices.length; j++) {
+            if (vertices[i].reduce((acc, val, k) => acc + Math.abs(val - vertices[j][k]), 0) === 2) {
+                edges.push([i, j]);
             }
         }
-        return edges;
     }
-    function rotateAndProject(pos, angles) {
-        let dimensions = pos.length;
-        let new_pos = [...pos];
+    return edges;
+}
 
-        for (let i = 0; i < dimensions; i++) {
-            for (let j = i + 1; j < dimensions; j++) {
-                const angle = angles[i][j] * Math.PI / 180;
-                const cos = Math.cos(angle);
-                const sin = Math.sin(angle);
-                const tempI = new_pos[i] * cos - new_pos[j] * sin;
-                const tempJ = new_pos[i] * sin + new_pos[j] * cos;
-                new_pos[i] = tempI;
-                new_pos[j] = tempJ;
+function rotateAndProject(pos, angles, size, center_pos) {
+    let dimensions = pos.length;
+    let new_pos = [...pos];
+
+    for (let i = 0; i < dimensions; i++) {
+        for (let j = i + 1; j < dimensions; j++) {
+            const angle = angles[i][j] * Math.PI / 180;
+            const cos = Math.cos(angle);
+            const sin = Math.sin(angle);
+            const tempI = new_pos[i] * cos - new_pos[j] * sin;
+            const tempJ = new_pos[i] * sin + new_pos[j] * cos;
+            new_pos[i] = tempI;
+            new_pos[j] = tempJ;
+        }
+    }
+
+    return {
+        x: new_pos[0] * size / 2 + center_pos.x,
+        y: new_pos[1] * size + center_pos.y,
+    };
+}
+
+function waitTilReady(client) {
+    return new Promise((res) => {
+        let check = setInterval(() => {
+            let ok = true;
+            for (let cl of client.clients) {
+                if (!cl.isConnected() || !users.has(cl.socket.id)) {
+                    ok = false;
+                }
+            }
+            if (ok) {
+                clearInterval(check);
+                return res();
+            }
+        }, 20);
+    });
+}
+
+const client = new CursorDancePartyHandler("https://cursordanceparty.com");
+client.cursor_animation = {};
+
+client.on("self-joined", async (data) => {
+    client.setMousePos(0.01, 0.02).setMouseScale(0.25).setMouseCursor(CursorTypes.WAIT);
+
+    const start_t = Date.now();
+    let velocities = {};
+    const velocity = 0.003;
+    client.cursor_animation = {
+        type: "infinity",
+        timeouts: {},
+        velocity: velocity,
+        bound_x: 1,
+        bound_y: 1,
+        velocity_x: velocity / 2, // the width is 2x longer than the height
+        velocity_y: velocity,
+        x: client.cursor_animation.x ?? 0.5,
+        y: client.cursor_animation.y ?? 0.5,
+        center_x: 0.5,
+        center_y: 0.5,
+        angle: 0,
+    };
+
+    setInterval(async () => {
+        const now = performance.now();
+        const dt = (now - (client.last_frame || now)) / 1000; // Delta time in seconds
+        client.last_frame = now;
+
+        if (client.following && client.mouse) {
+            if (client.mouse.x !== client.following.mouse.x || client.mouse.y !== client.following.mouse.y) {
+                client.cursor_animation.x = Number(client.following.mouse.x);
+                client.cursor_animation.y = Number(client.following.mouse.y);
+
+                client.setMousePos(client.following.mouse.x, client.following.mouse.y);
             }
         }
 
-        return {
-            x: new_pos[0] * size / 2 + center_pos.x,
-            y: new_pos[1] * size + center_pos.y
-        };
-    }
-    function waitTilReady(client) {
-        return new Promise(res => {
-            var check = setInterval(() => {
-                let ok = true;
-                for (let cl of client.clients) {
-                    if (!cl.isConnected() || !users.get(cl._id)) {
-                        ok = false;
+        for (let [_id, user] of client.users.entries()) {
+            const distance_factor = 1.5;
+            if (!velocities[user._id]) {
+                velocities[user._id] = { last_x: user.mouse.x, last_y: user.mouse.y };
+            }
+
+            let distance = Math.sqrt((user.mouse.x - velocities[user._id].last_x) ** 2 + (user.mouse.y - velocities[user._id].last_y) ** 2);
+            let factor = distance ? distance_factor / distance : 0;
+
+            velocities[user._id].velocity_x = (user.mouse.x - velocities[user._id].last_x) * factor;
+            velocities[user._id].velocity_y = (user.mouse.y - velocities[user._id].last_y) * factor;
+            velocities[user._id].last_x = user.mouse.x;
+            velocities[user._id].last_y = user.mouse.y;
+        }
+
+        if (client.cursor_animation && client.mouse) {
+            let anim = client.cursor_animation;
+            switch (anim.type) {
+                case "dvd": {
+                    if (anim.x > anim.bound_x || anim.x < 0) anim.velocity_x *= -1;
+                    if (anim.y > anim.bound_y || anim.y < 0) anim.velocity_y *= -1;
+                    anim.x += anim.velocity_x * dt * 64;
+                    anim.y += anim.velocity_y * dt * 64;
+                    break;
+                }
+                case "circle": {
+                    const radius = 0.15;
+
+                    anim.angle += dt * 2;
+                    anim.x = anim.center_x + Math.cos(anim.angle) * radius / 2;
+                    anim.y = anim.center_y + Math.sin(anim.angle) * radius;
+                    break;
+                }
+                case "infinity": {
+                    const radius = 0.15;
+
+                    anim.angle += dt * 2;
+                    anim.x = anim.center_x + Math.cos(anim.angle) * radius;
+                    anim.y = anim.center_y + Math.sin(anim.angle * 2) * radius;
+                    break;
+                }
+                case "spiral": {
+                    let radius = Math.sin(anim.angle / 4) * 0.3 + 0.2;
+
+                    anim.angle += dt;
+                    anim.x = anim.center_x + Math.cos(anim.angle) * radius / 2;
+                    anim.y = anim.center_y + Math.sin(anim.angle) * radius;
+                    break;
+                }
+                case "sine": {
+                    if (anim.x > anim.bound_x || anim.x < 0) {
+                        anim.velocity_x *= -1;
                     }
+
+                    anim.x += anim.velocity_x;
+                    anim.y += anim.velocity_y * Math.cos(anim.angle);
+                    anim.angle += dt;
+                    break;
                 }
-                if (ok) {
-                    clearInterval(check);
-                    return res();
-                }
-            }, 20);
-        });
-    }
+                case "leaf": {
+                    let offset = 0.1;
 
-    var center_pos = { x: 0.5, y: 0.5 };
-    var center = null;
-    var dimensions = 3;
-    var resolution = 2;
-    var size = 0.1;
-    var speed = 1.5;
+                    let newX = anim.x + Math.cos(anim.angle) / 1024;
+                    let newY = anim.y + anim.velocity_y * dt * 8;
 
-    client.on("self-joined", async (data) => {
-        client.setMousePos(0.01, 0.02).setMouseCursor(CursorTypes.POINTER_BACK).rotateMouse();
-
-        const vertices = generateVertices(dimensions);
-        const edges = generateEdges(vertices);
-        const edge_points = resolution - 2;
-        const count = edges.length * edge_points + vertices.length;
-
-        console.log(`Starting cursorbots animation...`);
-        console.log(`Dimensions: \`${dimensions}D\` | Resolution: \`${resolution}/edge\` | Size: \`${size}\` | Speed: \`${speed}x\` | Total clients: \`${count}\``);
-
-        for (let i = 0; i < count; i++) {
-            let id = i + 1;
-            await client.wait(0);
-
-            let cl = new CursorDancePartyHandler(client.uri, client.origin);
-            await cl.connect();
-
-            client.clients.push(cl);
-            cl.on("self-joined", async () => {
-                const angles = Array.from({ length: dimensions }, () => Array(dimensions).fill(0));
-                console.log(`Client ${id} joined!`);
-
-                await waitTilReady(client);
-
-                let pos;
-                if (i < vertices.length) {
-                    pos = vertices[i];
-                } else {
-                    const edge = Math.floor((i - vertices.length) / edge_points);
-                    const t = ((i - vertices.length) % edge_points + 1) / (edge_points + 1);
-                    const v0 = vertices[edges[edge][0]];
-                    const v1 = vertices[edges[edge][1]];
-                    pos = v0.map((v, idx) => v * (1 - t) + v1[idx] * t);
-                }
-
-                let spin = setInterval(() => {
-                    if (!cl.isConnected()) {
-                        return clearInterval(spin);
+                    if (anim.y > anim.bound_y) {
+                        newY = 0;
+                        newX = Math.rand(offset, anim.bound_x - offset);
                     }
-                    let { x, y } = rotateAndProject(pos, angles);
-                    cl.setMousePos(x, y).setMouseScale(0.25).setMouseCursor(CursorTypes.WAIT)
 
-                    for (let a = 0; a < dimensions; a++) {
-                        for (let b = a + 1; b < dimensions; b++) {
-                            angles[a][b] += speed;
+                    anim.x = newX;
+                    anim.y = newY;
+                    anim.angle += dt;
+                    break;
+                }
+                case "pong": {
+                    let radius = 0.04;
+                    let timeout = 500;
+
+                    if (anim.x > anim.bound_x || anim.x < 0) {
+                        anim.velocity_x *= -1; // Reverse velocity on wall collision
+                    }
+                    if (anim.y > anim.bound_y || anim.y < 0) {
+                        anim.velocity_y *= -1; // Reverse velocity on wall collision
+                    }
+
+                    for (let [_id, user] of client.users.entries()) {
+                        if (user._id == client._id) continue;
+
+                        let dx = user.mouse.x - anim.x;
+                        let dy = user.mouse.y - anim.y;
+                        let distance = Math.sqrt(dx * dx + dy * dy);
+
+                        if (distance <= radius && !anim.timeouts[user._id]) {
+                            let normalX = dx / distance;
+                            let normalY = dy / distance;
+                            let dot = anim.velocity_x * normalX + anim.velocity_y * normalY;
+                            anim.velocity_x -= 2 * dot * normalX;
+                            anim.velocity_y -= 2 * dot * normalY;
+
+                            anim.timeouts[user._id] = true;
+                            await client.wait(timeout);
+                            if (anim) {
+                                anim.timeouts[user._id] = false;
+                            }
                         }
                     }
-                }, 100);
-            });
 
-            console.log(`Starting client ${id}`);
-        }
+                    anim.x += anim.velocity_x;
+                    anim.y += anim.velocity_y;
+                    break;
+                }
+                case "bounce": {
+                    let radius = 0.04;
+                    let timeout = 500;
+                    let g = 0.2; // Acceleration due to gravity
+                    let initialY = anim.y; // Initial Y position of the cursor
+                    let initialVelY = anim.velocity_y; // Initial velocity in the Y direction
 
-        client.clients[0].on("mouse-coords", (data) => {
-            if (data.id === center) {
-                center_pos = { x: data.mouse.x, y: data.mouse.y };
+                    let newY = initialY + initialVelY * dt + 0.5 * g * dt * dt;
+                    let newVelY = initialVelY + g * dt;
+
+                    if (newY > anim.bound_y) {
+                        newVelY = -Math.rand(g, g * 3);
+                    }
+                    if (newY < 0) {
+                        newVelY *= -0.5;
+                    }
+                    if (anim.x > anim.bound_x || anim.x < 0) {
+                        anim.velocity_x *= -1;
+                    }
+
+                    anim.x += anim.velocity_x;
+                    anim.y = newY;
+                    anim.velocity_y = newVelY;
+                    break;
+                }
+                case "hockey": {
+                    let radius = 0.04;
+                    let dampen = 0.99;
+                    let timeout = 500;
+
+                    for (let [_id, user] of client.users.entries()) {
+                        if (user._id == client._id) continue;
+                        if (!velocities[user._id].velocity_x || !velocities[user._id].velocity_y) continue;
+
+                        let dx = user.mouse.x - anim.x;
+                        let dy = user.mouse.y - anim.y;
+                        let distance = Math.sqrt(dx * dx + dy * dy);
+
+                        if (distance <= radius && !anim.timeouts[user._id]) {
+                            let normalX = dx / distance;
+                            let normalY = dy / distance;
+
+                            let relativeVelocityX = anim.velocity_x - velocities[user._id].velocity_x / 512;
+                            let relativeVelocityY = anim.velocity_y - velocities[user._id].velocity_y / 512;
+                            let dotProduct = relativeVelocityX * normalX + relativeVelocityY * normalY;
+
+                            anim.velocity_x -= 2 * dotProduct * normalX;
+                            anim.velocity_y -= 2 * dotProduct * normalY;
+
+                            anim.timeouts[user._id] = true;
+                            await client.wait(timeout);
+                            if (anim) {
+                                anim.timeouts[user._id] = false;
+                            }
+                        }
+                    }
+
+                    anim.x += anim.velocity_x;
+                    anim.y += anim.velocity_y;
+                    anim.velocity_x *= dampen;
+                    anim.velocity_y *= dampen;
+
+                    if (anim.x > anim.bound_x || anim.x < 0) {
+                        anim.velocity_x *= -dampen;
+                    }
+                    if (anim.y > anim.bound_y || anim.y < 0) {
+                        anim.velocity_y *= -dampen;
+                    }
+
+                    anim.x = Math.clamp(0, anim.x, anim.bound_x);
+                    anim.y = Math.clamp(0, anim.y, anim.bound_y);
+                    break;
+                }
             }
-        });
-    });
 
-    client.on("partier-joined", (data) => {
-        const user = new User(data.id);
-        users.set(data.id, user);
-    });
-
-    client.on("partier-left", (data) => {
-        if (users.has(data.id)) {
-            users.delete(data.id);
+            client.setMousePos(anim.x, anim.y, true);
         }
-    });
+    }, 1000 / config.fps.cursor_animation);
 
-    client.on("mouse-coords", (data) => {
-        if (!users.has(data.id)) {
-            const user = new User(data.id);
-            users.set(data.id, user);
-        }
+});
 
-        const user = users.get(data.id);
-        user.setMouseData(data.mouse);
-    });
-})();
+client.start();

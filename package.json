@@ -3,7 +3,9 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "engine.io": "^6.6.4",
     "node-fetch": "^2.6.6",
+    "socket.io-client": "^2.4.0",
     "ws": "^8.18.1"
   }
 }
