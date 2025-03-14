@@ -33,7 +33,7 @@ const CursorTypes = {
     TIMER: 13,
 };
 
-class CursorDancePartyHandler {
+class CursorDancePartyClient {
     constructor(uri) {
         this.uri = uri;
         this.socket = null;
@@ -42,21 +42,22 @@ class CursorDancePartyHandler {
         this.last_mouse = "";
         this.clients = [];
         this.users = new Map();
+
+        this.socket = io(this.uri, {
+            transports: ["websocket", "polling"],
+            path: "/socket.io",
+            autoConnect: false,
+        });
+        this.bindSocketEvents();
     }
 
-    // Combined connection/start method.
-    // Returns a promise that resolves with "this" to allow daisy chaining.
     start() {
         return new Promise((resolve, reject) => {
             console.log(`[DEBUG] Attempting to connect to ${this.uri}`);
-            this.socket = io(this.uri, {
-                transports: ["websocket", "polling"],
-                path: "/socket.io"
-            });
+            this.socket.connect();
 
             this.socket.on("connect", () => {
                 console.log(`[DEBUG] Connected. Socket ID: ${this.socket.id}`);
-                this.bindSocketEvents();
                 this.socket.emit("self-joined");
                 if (this.handlers["self-joined"]) {
                     setTimeout(() => {
@@ -95,13 +96,8 @@ class CursorDancePartyHandler {
 
     // New stop method to cleanly disconnect.
     stop() {
-        if (this.mouse_buffer_interval) {
-            clearInterval(this.mouse_buffer_interval);
-            this.mouse_buffer_interval = null;
-        }
         if (this.socket) {
             this.socket.disconnect();
-            this.socket = null;
         }
         return this;
     }
@@ -111,10 +107,7 @@ class CursorDancePartyHandler {
     }
 
     bindSocketEvents() {
-        Object.keys(this.handlers).forEach((event) => {
-            this.socket.on(event, this.handlers[event]);
-        });
-
+        // Bind predefined events using the custom on() method.
         this.on("partier-joined", (data) => {
             console.log("[DEBUG] Partier joined:", data.id);
             const user = new User(data.id);
@@ -136,6 +129,11 @@ class CursorDancePartyHandler {
             const user = this.users.get(data.id);
             user.setMouseData(data.mouse);
         });
+
+        // Remove the duplicate binding loop since the "on" method already binds the handler:
+        // Object.keys(this.handlers).forEach((event) => {
+        //     this.socket.on(event, this.handlers[event]);
+        // });
 
         this.bindIntervals();
         return this;
@@ -170,14 +168,9 @@ class CursorDancePartyHandler {
         return new Promise((res) => setTimeout(res, ms));
     }
 
-    setMousePos(x, y, clamp = false) {
-        if (clamp) {
-            x = Math.clamp(0, x, 1);
-            y = Math.clamp(0, y, 1);
-        }
-
-        this.mouse.x = x;
-        this.mouse.y = y;
+    setMousePos(x, y) {
+        this.mouse.x = Math.clamp(0.001, x, 0.999);
+        this.mouse.y = Math.clamp(0.001, y, 0.999);
         return this;
     }
 
@@ -291,7 +284,7 @@ function waitTilReady(client) {
     });
 }
 
-const client = new CursorDancePartyHandler("https://cursordanceparty.com");
+const client = new CursorDancePartyClient("https://cursordanceparty.com");
 client.cursor_animation = {};
 
 client.on("self-joined", async (data) => {
@@ -301,7 +294,7 @@ client.on("self-joined", async (data) => {
     let velocities = {};
     const velocity = 0.003;
     client.cursor_animation = {
-        type: "infinity",
+        type: process.argv[2],
         timeouts: {},
         velocity: velocity,
         bound_x: 1,
@@ -348,23 +341,21 @@ client.on("self-joined", async (data) => {
             let anim = client.cursor_animation;
             switch (anim.type) {
                 case "dvd": {
-                    if (anim.x > anim.bound_x || anim.x < 0) anim.velocity_x *= -1;
-                    if (anim.y > anim.bound_y || anim.y < 0) anim.velocity_y *= -1;
+                    if (anim.x >= anim.bound_x || anim.x <= 0) anim.velocity_x *= -1;
+                    if (anim.y >= anim.bound_y || anim.y <= 0) anim.velocity_y *= -1;
                     anim.x += anim.velocity_x * dt * 64;
                     anim.y += anim.velocity_y * dt * 64;
                     break;
                 }
                 case "circle": {
                     const radius = 0.15;
-
                     anim.angle += dt * 2;
-                    anim.x = anim.center_x + Math.cos(anim.angle) * radius / 2;
+                    anim.x = anim.center_x + Math.cos(anim.angle) * (radius / 2);
                     anim.y = anim.center_y + Math.sin(anim.angle) * radius;
                     break;
                 }
                 case "infinity": {
                     const radius = 0.15;
-
                     anim.angle += dt * 2;
                     anim.x = anim.center_x + Math.cos(anim.angle) * radius;
                     anim.y = anim.center_y + Math.sin(anim.angle * 2) * radius;
@@ -372,63 +363,55 @@ client.on("self-joined", async (data) => {
                 }
                 case "spiral": {
                     let radius = Math.sin(anim.angle / 4) * 0.3 + 0.2;
-
                     anim.angle += dt;
-                    anim.x = anim.center_x + Math.cos(anim.angle) * radius / 2;
+                    anim.x = anim.center_x + Math.cos(anim.angle) * (radius / 2);
                     anim.y = anim.center_y + Math.sin(anim.angle) * radius;
                     break;
                 }
                 case "sine": {
-                    if (anim.x > anim.bound_x || anim.x < 0) {
+                    if (anim.x >= anim.bound_x || anim.x <= 0) {
                         anim.velocity_x *= -1;
                     }
-
-                    anim.x += anim.velocity_x;
-                    anim.y += anim.velocity_y * Math.cos(anim.angle);
+                    // Multiply by dt to keep the movement consistent regardless of frame rate.
+                    anim.x += anim.velocity_x * dt * 64;
+                    anim.y += anim.velocity_y * Math.cos(anim.angle) * dt * 64;
                     anim.angle += dt;
                     break;
                 }
                 case "leaf": {
                     let offset = 0.1;
-
-                    let newX = anim.x + Math.cos(anim.angle) / 1024;
+                    // Scale both X and Y updates by dt.
+                    let newX = anim.x + Math.cos(anim.angle) * dt / 16;
                     let newY = anim.y + anim.velocity_y * dt * 8;
-
-                    if (anim.y > anim.bound_y) {
+                    if (anim.y >= anim.bound_y) {
                         newY = 0;
                         newX = Math.rand(offset, anim.bound_x - offset);
                     }
-
                     anim.x = newX;
                     anim.y = newY;
                     anim.angle += dt;
                     break;
                 }
                 case "pong": {
-                    let radius = 0.04;
-                    let timeout = 500;
-
-                    if (anim.x > anim.bound_x || anim.x < 0) {
-                        anim.velocity_x *= -1; // Reverse velocity on wall collision
+                    let radius = 0.1;
+                    let timeout = 1000;
+                    if (anim.x >= anim.bound_x || anim.x < 0) {
+                        anim.velocity_x *= -1;
                     }
-                    if (anim.y > anim.bound_y || anim.y < 0) {
-                        anim.velocity_y *= -1; // Reverse velocity on wall collision
+                    if (anim.y >= anim.bound_y || anim.y < 0) {
+                        anim.velocity_y *= -1;
                     }
-
                     for (let [_id, user] of client.users.entries()) {
                         if (user._id == client._id) continue;
-
                         let dx = user.mouse.x - anim.x;
                         let dy = user.mouse.y - anim.y;
                         let distance = Math.sqrt(dx * dx + dy * dy);
-
-                        if (distance <= radius && !anim.timeouts[user._id]) {
+                        if (distance <= radius * user.mouse.scale && !anim.timeouts[user._id]) {
                             let normalX = dx / distance;
                             let normalY = dy / distance;
                             let dot = anim.velocity_x * normalX + anim.velocity_y * normalY;
                             anim.velocity_x -= 2 * dot * normalX;
                             anim.velocity_y -= 2 * dot * normalY;
-
                             anim.timeouts[user._id] = true;
                             await client.wait(timeout);
                             if (anim) {
@@ -436,59 +419,45 @@ client.on("self-joined", async (data) => {
                             }
                         }
                     }
-
-                    anim.x += anim.velocity_x;
-                    anim.y += anim.velocity_y;
+                    anim.x += anim.velocity_x * dt * 64;
+                    anim.y += anim.velocity_y * dt * 64;
                     break;
                 }
                 case "bounce": {
-                    let radius = 0.04;
-                    let timeout = 500;
-                    let g = 0.2; // Acceleration due to gravity
-                    let initialY = anim.y; // Initial Y position of the cursor
-                    let initialVelY = anim.velocity_y; // Initial velocity in the Y direction
-
+                    let g = 0.25;
+                    let initialY = anim.y;
+                    let initialVelY = anim.velocity_y;
                     let newY = initialY + initialVelY * dt + 0.5 * g * dt * dt;
                     let newVelY = initialVelY + g * dt;
 
-                    if (newY > anim.bound_y) {
+                    if (newY >= anim.bound_y) {
                         newVelY = -Math.rand(g, g * 3);
                     }
-                    if (newY < 0) {
+                    if (newY <= 0) {
                         newVelY *= -0.5;
+                        newY = 0;
                     }
-                    if (anim.x > anim.bound_x || anim.x < 0) {
+                    if (anim.x >= anim.bound_x || anim.x < 0) {
                         anim.velocity_x *= -1;
                     }
 
-                    anim.x += anim.velocity_x;
+                    anim.x += anim.velocity_x * dt * 64;
                     anim.y = newY;
                     anim.velocity_y = newVelY;
-                    break;
-                }
-                case "hockey": {
-                    let radius = 0.04;
-                    let dampen = 0.99;
-                    let timeout = 500;
+
+                    let radius = 0.1;
+                    let bounciniess = 1.05;
+                    let timeout = 1000;
 
                     for (let [_id, user] of client.users.entries()) {
-                        if (user._id == client._id) continue;
-                        if (!velocities[user._id].velocity_x || !velocities[user._id].velocity_y) continue;
+                        if (user._id === client._id) continue;
 
                         let dx = user.mouse.x - anim.x;
                         let dy = user.mouse.y - anim.y;
                         let distance = Math.sqrt(dx * dx + dy * dy);
 
-                        if (distance <= radius && !anim.timeouts[user._id]) {
-                            let normalX = dx / distance;
-                            let normalY = dy / distance;
-
-                            let relativeVelocityX = anim.velocity_x - velocities[user._id].velocity_x / 512;
-                            let relativeVelocityY = anim.velocity_y - velocities[user._id].velocity_y / 512;
-                            let dotProduct = relativeVelocityX * normalX + relativeVelocityY * normalY;
-
-                            anim.velocity_x -= 2 * dotProduct * normalX;
-                            anim.velocity_y -= 2 * dotProduct * normalY;
+                        if (distance <= radius * user.mouse.scale && !anim.timeouts[user._id]) {
+                            anim.velocity_y = -Math.abs(anim.velocity_y) * bounciniess;
 
                             anim.timeouts[user._id] = true;
                             await client.wait(timeout);
@@ -497,29 +466,52 @@ client.on("self-joined", async (data) => {
                             }
                         }
                     }
-
-                    anim.x += anim.velocity_x;
-                    anim.y += anim.velocity_y;
-                    anim.velocity_x *= dampen;
-                    anim.velocity_y *= dampen;
-
-                    if (anim.x > anim.bound_x || anim.x < 0) {
-                        anim.velocity_x *= -dampen;
+                    break;
+                }
+                case "hockey": {
+                    let radius = 0.1;
+                    let dampening = 0.99;
+                    let timeout = 1000;
+                    for (let [_id, user] of client.users.entries()) {
+                        if (user._id == client._id) continue;
+                        if (!velocities[user._id].velocity_x || !velocities[user._id].velocity_y) continue;
+                        let dx = user.mouse.x - anim.x;
+                        let dy = user.mouse.y - anim.y;
+                        let distance = Math.sqrt(dx * dx + dy * dy);
+                        if (distance <= radius * user.mouse.scale && !anim.timeouts[user._id]) {
+                            let normalX = dx / distance;
+                            let normalY = dy / distance;
+                            let relativeVelocityX = anim.velocity_x - velocities[user._id].velocity_x / 512;
+                            let relativeVelocityY = anim.velocity_y - velocities[user._id].velocity_y / 512;
+                            let dotProduct = relativeVelocityX * normalX + relativeVelocityY * normalY;
+                            anim.velocity_x -= 2 * dotProduct * normalX;
+                            anim.velocity_y -= 2 * dotProduct * normalY;
+                            anim.timeouts[user._id] = true;
+                            await client.wait(timeout);
+                            if (anim) {
+                                anim.timeouts[user._id] = false;
+                            }
+                        }
                     }
-                    if (anim.y > anim.bound_y || anim.y < 0) {
-                        anim.velocity_y *= -dampen;
+                    anim.x += anim.velocity_x * dt * 64;
+                    anim.y += anim.velocity_y * dt * 64;
+                    anim.velocity_x *= dampening;
+                    anim.velocity_y *= dampening;
+                    if (anim.x >= anim.bound_x || anim.x < 0) {
+                        anim.velocity_x *= -dampening;
                     }
-
+                    if (anim.y >= anim.bound_y || anim.y < 0) {
+                        anim.velocity_y *= -dampening;
+                    }
                     anim.x = Math.clamp(0, anim.x, anim.bound_x);
                     anim.y = Math.clamp(0, anim.y, anim.bound_y);
                     break;
                 }
             }
 
-            client.setMousePos(anim.x, anim.y, true);
+            client.setMousePos(anim.x, anim.y);
         }
     }, 1000 / config.fps.cursor_animation);
-
 });
 
 client.start();
